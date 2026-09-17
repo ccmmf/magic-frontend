@@ -1,0 +1,2 @@
+# magic-frontend
+Collected view
