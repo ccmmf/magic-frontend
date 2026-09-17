@@ -10,17 +10,6 @@ DEFAULT_ENV="${HOME}/.conda/envs/pecan-all"
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
-aws_version_ok() {
-  command -v aws >/dev/null 2>&1 || return 1
-  local ver major minor
-  ver=$(aws --version 2>&1 | awk '{print $1}' | cut -d/ -f2)
-  major=$(echo "${ver}" | cut -d. -f1)
-  minor=$(echo "${ver}" | cut -d. -f2)
-  [[ "${major}" -ge 2 ]] && return 0
-  [[ "${major}" -eq 1 && "${minor}" -ge 29 ]] && return 0
-  return 1
-}
-
 validate() {
   log "Verifying..."
   R_LIBS="${PECAN_ENV}/lib/R/library" \
@@ -68,11 +57,7 @@ cleanup() { rm -f "${TARBALL}"; }
 trap cleanup EXIT
 
 # ---- PREFLIGHT ----
-if ! aws_version_ok; then
-  log "aws CLI not found or version too old. Attempting to load the aws module..."
-  module load aws 2>/dev/null || true
-  aws_version_ok || die "aws CLI >= 1.29 (or v2) is required. Install a compatible version or load the aws module before running this script."
-fi
+command -v aws >/dev/null 2>&1 || die "aws CLI not found. Install or load it before running this script."
 
 if ! grep -qs "\[${S3_PROFILE}\]" "${HOME}/.aws/credentials" 2>/dev/null; then
   die "
@@ -106,24 +91,7 @@ if [[ -e "${PECAN_ENV}" ]]; then
   RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
   RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
   RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
-  ARROW_HOME="${PECAN_ENV}" \
-  PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
-  PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
     "${PECAN_ENV}/bin/Rscript" -e "
-      options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
-      renv::restore(lockfile = '${PECAN_ENV}/renv.lock', packages = c('PEcAnAssimSequential', 'nneo', 'amerifluxr'), prompt = FALSE)
-    "
-  R_LIBS="${PECAN_ENV}/lib/R/library" \
-  R_LIBS_USER="" \
-  R_LIBS_SITE="" \
-  RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
-  RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
-  RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
-  ARROW_HOME="${PECAN_ENV}" \
-  PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
-  PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
-    "${PECAN_ENV}/bin/Rscript" -e "
-      options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
       renv::restore(lockfile = '${PECAN_ENV}/renv.lock', prompt = FALSE)
     "
   validate
@@ -163,24 +131,7 @@ R_LIBS_SITE="" \
 RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
 RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
 RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
-ARROW_HOME="${PECAN_ENV}" \
-PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
-PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
   "${PECAN_ENV}/bin/Rscript" -e "
-    options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
-    renv::restore(lockfile = '${PECAN_ENV}/renv.lock', packages = c('PEcAnAssimSequential', 'nneo', 'amerifluxr'), prompt = FALSE)
-  "
-R_LIBS="${PECAN_ENV}/lib/R/library" \
-R_LIBS_USER="" \
-R_LIBS_SITE="" \
-RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
-RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
-RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
-ARROW_HOME="${PECAN_ENV}" \
-PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
-PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
-  "${PECAN_ENV}/bin/Rscript" -e "
-    options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
     renv::restore(lockfile = '${PECAN_ENV}/renv.lock', prompt = FALSE)
   "
 
