@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---- CONFIG ----
+S3_PROFILE="${AWS_PROFILE:-magic}"
+S3_BUCKET="s3://carb/environments"
+DEFAULT_ENV="${HOME}/.conda/envs/pecan-all"
+
+# ---- HELPERS ----
+log()  { echo "[$(date '+%H:%M:%S')] $*"; }
+die()  { echo "ERROR: $*" >&2; exit 1; }
+
+aws_version_ok() {
+  command -v aws >/dev/null 2>&1 || return 1
+  local ver major minor
+  ver=$(aws --version 2>&1 | awk '{print $1}' | cut -d/ -f2)
+  major=$(echo "${ver}" | cut -d. -f1)
+  minor=$(echo "${ver}" | cut -d. -f2)
+  [[ "${major}" -ge 2 ]] && return 0
+  [[ "${major}" -eq 1 && "${minor}" -ge 29 ]] && return 0
+  return 1
+}
+
+validate() {
+  log "Verifying..."
+  R_LIBS="${PECAN_ENV}/lib/R/library" \
+  R_LIBS_USER="" \
+  R_LIBS_SITE="" \
+    "${PECAN_ENV}/bin/Rscript" -e "
+      library('PEcAn.all')
+      library('PEcAn.RothC')
+      library('PEcAn.SIPNET')
+      library('PEPRMT')
+      library('tidyverse')
+      library('here')
+      library('arrow')
+      library('duckdb')
+    " || die "Validation failed. Environment at ${PECAN_ENV} may be incomplete."
+  log "Validation complete."
+}
+
+# ---- ARGS ----
+usage() {
+  echo "Usage: $0 <VERSION> [ENV_PATH]"
+  echo ""
+  echo "  VERSION   Required. PEcAn environment version to install (e.g. 1.10)."
+  echo "            Resolves to: ${S3_BUCKET}/pecan-all-<VERSION>.tar.gz"
+  echo "  ENV_PATH  Optional. Directory to install the environment."
+  echo "            Default: ~/.conda/envs/pecan-all"
+  echo ""
+  echo "Requirements: aws CLI with a configured profile (default: 'magic'), conda on PATH."
+  echo "  Override profile: AWS_PROFILE=myprofile $0 <VERSION>"
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+[[ -z "${1:-}" ]] && { usage; die "VERSION is required."; }
+PECAN_VERSION="${1}"
+PECAN_ENV="${2:-${DEFAULT_ENV}}"
+S3_TARBALL="${S3_BUCKET}/pecan-all-${PECAN_VERSION}.tar.gz"
+
+# Download to a temp file; clean up on exit regardless of success or failure.
+TARBALL="$(mktemp).tar.gz"
+cleanup() { rm -f "${TARBALL}"; }
+trap cleanup EXIT
+
+# ---- PREFLIGHT ----
+if ! aws_version_ok; then
+  log "aws CLI not found or version too old. Attempting to load the aws module..."
+  module load aws 2>/dev/null || true
+  aws_version_ok || die "aws CLI >= 1.29 (or v2) is required. Install a compatible version or load the aws module before running this script."
+fi
+
+if ! grep -qs "\[${S3_PROFILE}\]" "${HOME}/.aws/credentials" 2>/dev/null; then
+  die "
+       AWS profile '${S3_PROFILE}' not found in ~/.aws/credentials.
+
+       Add a [${S3_PROFILE}] section with aws_access_key_id and aws_secret_access_key.
+
+       Optionally, to use a different profile, set AWS_PROFILE before running:
+         AWS_PROFILE=myprofile $0 ${PECAN_VERSION:-<VERSION>}"
+fi
+if ! grep -qs "\[profile ${S3_PROFILE}\]" "${HOME}/.aws/config" 2>/dev/null; then
+  die "
+       AWS profile '${S3_PROFILE}' not found in ~/.aws/config.
+
+       Add a [profile ${S3_PROFILE}] section with region and endpoint_url.
+
+       Optionally, to use a different profile, set AWS_PROFILE before running:
+         AWS_PROFILE=myprofile $0 ${PECAN_VERSION:-<VERSION>}"
+fi
+if ! command -v conda >/dev/null 2>&1; then
+    log "conda not found. Attempting to load the conda module..."
+    module load conda 2>/dev/null || true
+    command -v conda >/dev/null 2>&1 || die "conda not found. Install Miniconda or load the conda module before running this script."
+fi
+
+if [[ -e "${PECAN_ENV}" ]]; then
+  log "Target path already exists: ${PECAN_ENV}. Skipping install — restoring and validating."
+  R_LIBS="${PECAN_ENV}/lib/R/library" \
+  R_LIBS_USER="" \
+  R_LIBS_SITE="" \
+  RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
+  RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
+  RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
+  ARROW_HOME="${PECAN_ENV}" \
+  PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+  PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+    "${PECAN_ENV}/bin/Rscript" -e "
+      options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
+      renv::restore(lockfile = '${PECAN_ENV}/renv.lock', packages = c('PEcAnAssimSequential', 'nneo', 'amerifluxr'), prompt = FALSE)
+    "
+  R_LIBS="${PECAN_ENV}/lib/R/library" \
+  R_LIBS_USER="" \
+  R_LIBS_SITE="" \
+  RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
+  RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
+  RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
+  ARROW_HOME="${PECAN_ENV}" \
+  PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+  PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+    "${PECAN_ENV}/bin/Rscript" -e "
+      options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
+      renv::restore(lockfile = '${PECAN_ENV}/renv.lock', prompt = FALSE)
+    "
+  validate
+  echo ""
+  echo "Activate the environment with:"
+  echo "  conda activate ${PECAN_ENV}"
+  exit 0
+fi
+
+# ---- MAIN ----
+log "PEcAn version: ${PECAN_VERSION}"
+log "Target environment path: ${PECAN_ENV}"
+log "S3 tarball: ${S3_TARBALL}"
+
+# 1. Download
+log "Downloading PEcAn environment tarball from S3..."
+aws s3 cp --profile "${S3_PROFILE}" "${S3_TARBALL}" "${TARBALL}"
+
+# 2. Unpack
+log "Decompressing tarball..."
+mkdir -p "${PECAN_ENV}"
+tar -xzf "${TARBALL}" -C "${PECAN_ENV}"
+
+# 3. Fix embedded paths
+log "Fixing embedded paths (conda-unpack)..."
+set +u
+eval "$(conda shell.bash hook)"
+conda activate "${PECAN_ENV}"
+set -u
+conda-unpack
+
+# 4. Restore R packages
+log "Restoring R packages — this takes 20-40 minutes..."
+R_LIBS="${PECAN_ENV}/lib/R/library" \
+R_LIBS_USER="" \
+R_LIBS_SITE="" \
+RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
+RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
+RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
+ARROW_HOME="${PECAN_ENV}" \
+PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+  "${PECAN_ENV}/bin/Rscript" -e "
+    options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
+    renv::restore(lockfile = '${PECAN_ENV}/renv.lock', packages = c('PEcAnAssimSequential', 'nneo', 'amerifluxr'), prompt = FALSE)
+  "
+R_LIBS="${PECAN_ENV}/lib/R/library" \
+R_LIBS_USER="" \
+R_LIBS_SITE="" \
+RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
+RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
+RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
+ARROW_HOME="${PECAN_ENV}" \
+PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+  "${PECAN_ENV}/bin/Rscript" -e "
+    options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
+    renv::restore(lockfile = '${PECAN_ENV}/renv.lock', prompt = FALSE)
+  "
+
+# 5. Verify
+validate
+
+log "Setup complete."
+echo ""
+echo "Activate the environment with:"
+echo "  conda activate ${PECAN_ENV}"
