@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # ---- CONFIG ----
-S3_PROFILE="${AWS_PROFILE:-magic}"
+S3_ENDPOINT="https://s3.garage.ccmmf.ncsa.cloud"
 S3_BUCKET="s3://carb/environments"
+S3_REGION="garage"
 DEFAULT_ENV="${HOME}/.conda/envs/pecan-all"
 
 # ---- HELPERS ----
@@ -37,8 +38,7 @@ usage() {
   echo "  ENV_PATH  Optional. Directory to install the environment."
   echo "            Default: ~/.conda/envs/pecan-all"
   echo ""
-  echo "Requirements: aws CLI with a configured profile (default: 'magic'), conda on PATH."
-  echo "  Override profile: AWS_PROFILE=myprofile $0 <VERSION>"
+  echo "Requirements: aws CLI configured with appropriate credentials, conda on PATH."
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -58,25 +58,6 @@ trap cleanup EXIT
 
 # ---- PREFLIGHT ----
 command -v aws >/dev/null 2>&1 || die "aws CLI not found. Install or load it before running this script."
-
-if ! grep -qs "\[${S3_PROFILE}\]" "${HOME}/.aws/credentials" 2>/dev/null; then
-  die "
-       AWS profile '${S3_PROFILE}' not found in ~/.aws/credentials.
-
-       Add a [${S3_PROFILE}] section with aws_access_key_id and aws_secret_access_key.
-
-       Optionally, to use a different profile, set AWS_PROFILE before running:
-         AWS_PROFILE=myprofile $0 ${PECAN_VERSION:-<VERSION>}"
-fi
-if ! grep -qs "\[profile ${S3_PROFILE}\]" "${HOME}/.aws/config" 2>/dev/null; then
-  die "
-       AWS profile '${S3_PROFILE}' not found in ~/.aws/config.
-
-       Add a [profile ${S3_PROFILE}] section with region and endpoint_url.
-
-       Optionally, to use a different profile, set AWS_PROFILE before running:
-         AWS_PROFILE=myprofile $0 ${PECAN_VERSION:-<VERSION>}"
-fi
 if ! command -v conda >/dev/null 2>&1; then
     log "conda not found. Attempting to load the conda module..."
     module load conda 2>/dev/null || true
@@ -108,7 +89,7 @@ log "S3 tarball: ${S3_TARBALL}"
 
 # 1. Download
 log "Downloading PEcAn environment tarball from S3..."
-aws s3 cp --profile "${S3_PROFILE}" "${S3_TARBALL}" "${TARBALL}"
+aws s3 cp --endpoint-url "${S3_ENDPOINT}" --region "${S3_REGION}" "${S3_TARBALL}" "${TARBALL}"
 
 # 2. Unpack
 log "Decompressing tarball..."
@@ -117,8 +98,8 @@ tar -xzf "${TARBALL}" -C "${PECAN_ENV}"
 
 # 3. Fix embedded paths
 log "Fixing embedded paths (conda-unpack)..."
-set +u
 eval "$(conda shell.bash hook)"
+set +u
 conda activate "${PECAN_ENV}"
 set -u
 conda-unpack
