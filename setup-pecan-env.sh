@@ -2,14 +2,24 @@
 set -euo pipefail
 
 # ---- CONFIG ----
-S3_ENDPOINT="https://s3.garage.ccmmf.ncsa.cloud"
+S3_PROFILE="${AWS_PROFILE:-magic}"
 S3_BUCKET="s3://carb/environments"
-S3_REGION="garage"
 DEFAULT_ENV="${HOME}/.conda/envs/pecan-all"
 
 # ---- HELPERS ----
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
+
+aws_version_ok() {
+  command -v aws >/dev/null 2>&1 || return 1
+  local ver major minor
+  ver=$(aws --version 2>&1 | awk '{print $1}' | cut -d/ -f2)
+  major=$(echo "${ver}" | cut -d. -f1)
+  minor=$(echo "${ver}" | cut -d. -f2)
+  [[ "${major}" -ge 2 ]] && return 0
+  [[ "${major}" -eq 1 && "${minor}" -ge 29 ]] && return 0
+  return 1
+}
 
 validate() {
   log "Verifying..."
@@ -38,7 +48,8 @@ usage() {
   echo "  ENV_PATH  Optional. Directory to install the environment."
   echo "            Default: ~/.conda/envs/pecan-all"
   echo ""
-  echo "Requirements: aws CLI configured with appropriate credentials, conda on PATH."
+  echo "Requirements: aws CLI with a configured profile (default: 'magic'), conda on PATH."
+  echo "  Override profile: AWS_PROFILE=myprofile $0 <VERSION>"
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -57,7 +68,30 @@ cleanup() { rm -f "${TARBALL}"; }
 trap cleanup EXIT
 
 # ---- PREFLIGHT ----
-command -v aws >/dev/null 2>&1 || die "aws CLI not found. Install or load it before running this script."
+if ! aws_version_ok; then
+  log "aws CLI not found or version too old. Attempting to load the aws module..."
+  module load aws 2>/dev/null || true
+  aws_version_ok || die "aws CLI >= 1.29 (or v2) is required. Install a compatible version or load the aws module before running this script."
+fi
+
+if ! grep -qs "\[${S3_PROFILE}\]" "${HOME}/.aws/credentials" 2>/dev/null; then
+  die "
+       AWS profile '${S3_PROFILE}' not found in ~/.aws/credentials.
+
+       Add a [${S3_PROFILE}] section with aws_access_key_id and aws_secret_access_key.
+
+       Optionally, to use a different profile, set AWS_PROFILE before running:
+         AWS_PROFILE=myprofile $0 ${PECAN_VERSION:-<VERSION>}"
+fi
+if ! grep -qs "\[profile ${S3_PROFILE}\]" "${HOME}/.aws/config" 2>/dev/null; then
+  die "
+       AWS profile '${S3_PROFILE}' not found in ~/.aws/config.
+
+       Add a [profile ${S3_PROFILE}] section with region and endpoint_url.
+
+       Optionally, to use a different profile, set AWS_PROFILE before running:
+         AWS_PROFILE=myprofile $0 ${PECAN_VERSION:-<VERSION>}"
+fi
 if ! command -v conda >/dev/null 2>&1; then
     log "conda not found. Attempting to load the conda module..."
     module load conda 2>/dev/null || true
@@ -72,7 +106,32 @@ if [[ -e "${PECAN_ENV}" ]]; then
   RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
   RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
   RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
+  ARROW_HOME="${PECAN_ENV}" \
+  PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+  PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+  OPENBLAS_NUM_THREADS=1 \
+  OMP_NUM_THREADS=1 \
+  LIBRARY_PATH="${PECAN_ENV}/lib" \
+  LD_LIBRARY_PATH="${PECAN_ENV}/lib" \
     "${PECAN_ENV}/bin/Rscript" -e "
+      options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
+      renv::restore(lockfile = '${PECAN_ENV}/renv.lock', packages = c('PEcAnAssimSequential', 'nneo', 'amerifluxr'), prompt = FALSE)
+    "
+  R_LIBS="${PECAN_ENV}/lib/R/library" \
+  R_LIBS_USER="" \
+  R_LIBS_SITE="" \
+  RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
+  RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
+  RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
+  ARROW_HOME="${PECAN_ENV}" \
+  PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+  PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+  OPENBLAS_NUM_THREADS=1 \
+  OMP_NUM_THREADS=1 \
+  LIBRARY_PATH="${PECAN_ENV}/lib" \
+  LD_LIBRARY_PATH="${PECAN_ENV}/lib" \
+    "${PECAN_ENV}/bin/Rscript" -e "
+      options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
       renv::restore(lockfile = '${PECAN_ENV}/renv.lock', prompt = FALSE)
     "
   validate
@@ -89,7 +148,7 @@ log "S3 tarball: ${S3_TARBALL}"
 
 # 1. Download
 log "Downloading PEcAn environment tarball from S3..."
-aws s3 cp --endpoint-url "${S3_ENDPOINT}" --region "${S3_REGION}" "${S3_TARBALL}" "${TARBALL}"
+aws s3 cp --profile "${S3_PROFILE}" "${S3_TARBALL}" "${TARBALL}"
 
 # 2. Unpack
 log "Decompressing tarball..."
@@ -98,8 +157,8 @@ tar -xzf "${TARBALL}" -C "${PECAN_ENV}"
 
 # 3. Fix embedded paths
 log "Fixing embedded paths (conda-unpack)..."
-eval "$(conda shell.bash hook)"
 set +u
+eval "$(conda shell.bash hook)"
 conda activate "${PECAN_ENV}"
 set -u
 conda-unpack
@@ -112,7 +171,32 @@ R_LIBS_SITE="" \
 RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
 RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
 RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
+ARROW_HOME="${PECAN_ENV}" \
+PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+OPENBLAS_NUM_THREADS=1 \
+OMP_NUM_THREADS=1 \
+LIBRARY_PATH="${PECAN_ENV}/lib" \
+LD_LIBRARY_PATH="${PECAN_ENV}/lib" \
   "${PECAN_ENV}/bin/Rscript" -e "
+    options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
+    renv::restore(lockfile = '${PECAN_ENV}/renv.lock', packages = c('PEcAnAssimSequential', 'nneo', 'amerifluxr'), prompt = FALSE)
+  "
+R_LIBS="${PECAN_ENV}/lib/R/library" \
+R_LIBS_USER="" \
+R_LIBS_SITE="" \
+RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
+RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
+RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
+ARROW_HOME="${PECAN_ENV}" \
+PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+OPENBLAS_NUM_THREADS=1 \
+OMP_NUM_THREADS=1 \
+LIBRARY_PATH="${PECAN_ENV}/lib" \
+LD_LIBRARY_PATH="${PECAN_ENV}/lib" \
+  "${PECAN_ENV}/bin/Rscript" -e "
+    options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
     renv::restore(lockfile = '${PECAN_ENV}/renv.lock', prompt = FALSE)
   "
 
