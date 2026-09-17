@@ -5,6 +5,7 @@ set -euo pipefail
 S3_PROFILE="${AWS_PROFILE:-magic}"
 S3_BUCKET="s3://carb/environments"
 DEFAULT_ENV="${HOME}/.conda/envs/pecan-all"
+INSTALL_JOBS="${INSTALL_JOBS:-${SLURM_CPUS_PER_TASK:-2}}"
 
 # ---- HELPERS ----
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -50,6 +51,9 @@ usage() {
   echo ""
   echo "Requirements: aws CLI with a configured profile (default: 'magic'), conda on PATH."
   echo "  Override profile: AWS_PROFILE=myprofile $0 <VERSION>"
+  echo ""
+  echo "  Override parallel R package install jobs (default: \$SLURM_CPUS_PER_TASK, else 2):"
+  echo "    INSTALL_JOBS=4 $0 <VERSION>"
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -100,6 +104,40 @@ fi
 
 if [[ -e "${PECAN_ENV}" ]]; then
   log "Target path already exists: ${PECAN_ENV}. Skipping install — restoring and validating."
+  set +u
+  eval "$(conda shell.bash hook)"
+  conda activate "${PECAN_ENV}"
+  set -u
+  # PEcAn.data.remote and PEcAn.SIPNET are genuinely GitHub-subdir packages in the
+  # lockfile (modules/data.remote, models/sipnet — pulled off develop, not yet in an
+  # r-universe build). renv::restore()'s git-style subdir extraction for records like
+  # this stages into a path keyed only by package name, and collides with itself
+  # ("target file ... already exists" under renv-graph-staging) regardless of
+  # ordering or parallelism.
+  #
+  # Fix: renv::restore(exclude = ...) skips them, but its docs warn that an exclude
+  # request is ignored for any package still needed as a dependency of something else
+  # in scope — and PEcAn.all Depends on PEcAn.data.remote directly (confirmed against
+  # its DESCRIPTION), so excluding just the two targets (or even them plus the two
+  # dependents we first guessed at, PEcAn.workflow/PEcAnAssimSequential) still left
+  # PEcAn.all pulling PEcAn.data.remote back in and hitting the same staging bug. Rather
+  # than keep enumerating dependents by hand, the exclude set below is computed from
+  # each lockfile record's own Requirements field (renv's Depends+Imports+LinkingTo
+  # closure, the same one pak's restore graph itself uses) — the full set of packages
+  # that transitively require either target, however deep — so nothing is missed.
+  # This lets the rest of the lockfile — including arrow — restore normally, fully
+  # lockfile-pinned. Only then are the two broken records installed directly via
+  # renv::install(),
+  # bypassing restore()'s graph/staging path; pinned to the RemoteSha already recorded
+  # in the lockfile (not the floating "develop" branch) so this reuses the source
+  # tarball already cached at build time instead of re-resolving "develop" against
+  # GitHub right now and possibly pulling a different, untested commit. Doing this
+  # only after the exclude-restore matters: renv's pak backend installs with
+  # upgrade = FALSE, leaving already-installed dependencies alone unless a
+  # constraint demands otherwise (github.com/rstudio/renv/issues/2329) — so arrow
+  # needs to already be installed at the locked version by this point, or pak will
+  # freely resolve it (and got 25.0.1, which doesn't build against the older
+  # conda-linked libarrow, when this ran before arrow was restored).
   R_LIBS="${PECAN_ENV}/lib/R/library" \
   R_LIBS_USER="" \
   R_LIBS_SITE="" \
@@ -109,9 +147,25 @@ if [[ -e "${PECAN_ENV}" ]]; then
   ARROW_HOME="${PECAN_ENV}" \
   PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
   PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+  OPENBLAS_NUM_THREADS=1 \
+  OMP_NUM_THREADS=1 \
+  LIBRARY_PATH="${PECAN_ENV}/lib" \
+  LD_LIBRARY_PATH="${PECAN_ENV}/lib" \
     "${PECAN_ENV}/bin/Rscript" -e "
-      options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
-      renv::restore(lockfile = '${PECAN_ENV}/renv.lock', packages = c('PEcAnAssimSequential', 'nneo', 'amerifluxr'), prompt = FALSE)
+      options(renv.install.timeout = 21600, renv.config.install.jobs = ${INSTALL_JOBS})
+      lockfile <- renv:::renv_lockfile_read('${PECAN_ENV}/renv.lock')
+      targets <- c('PEcAn.data.remote', 'PEcAn.SIPNET')
+      reqs <- lapply(lockfile\$Packages, function(rec) if (is.null(rec\$Requirements)) character(0) else rec\$Requirements)
+      frontier <- targets
+      closure <- character(0)
+      repeat {
+        hit <- names(reqs)[vapply(reqs, function(r) any(frontier %in% r), logical(1))]
+        new <- setdiff(hit, closure)
+        if (!length(new)) break
+        closure <- union(closure, new)
+        frontier <- new
+      }
+      renv::restore(lockfile = '${PECAN_ENV}/renv.lock', exclude = union(targets, closure), prompt = FALSE)
     "
   R_LIBS="${PECAN_ENV}/lib/R/library" \
   R_LIBS_USER="" \
@@ -122,9 +176,47 @@ if [[ -e "${PECAN_ENV}" ]]; then
   ARROW_HOME="${PECAN_ENV}" \
   PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
   PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+  OPENBLAS_NUM_THREADS=1 \
+  OMP_NUM_THREADS=1 \
+  LIBRARY_PATH="${PECAN_ENV}/lib" \
+  LD_LIBRARY_PATH="${PECAN_ENV}/lib" \
     "${PECAN_ENV}/bin/Rscript" -e "
-      options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
-      renv::restore(lockfile = '${PECAN_ENV}/renv.lock', prompt = FALSE)
+      options(renv.install.timeout = 21600, repos = c(CRAN = 'https://cloud.r-project.org', pecan = 'https://pecanproject.r-universe.dev'), timeout = 600)
+      lockfile <- renv:::renv_lockfile_read('${PECAN_ENV}/renv.lock')
+      specs <- vapply(c('PEcAn.data.remote', 'PEcAn.SIPNET'), function(pkg) {
+        rec <- lockfile\$Packages[[pkg]]
+        paste0('github::', rec\$RemoteUsername, '/', rec\$RemoteRepo, '/', rec\$RemoteSubdir, '@', rec\$RemoteSha)
+      }, character(1))
+      renv::install(specs)
+    "
+  R_LIBS="${PECAN_ENV}/lib/R/library" \
+  R_LIBS_USER="" \
+  R_LIBS_SITE="" \
+  RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
+  RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
+  RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
+  ARROW_HOME="${PECAN_ENV}" \
+  PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+  PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+  OPENBLAS_NUM_THREADS=1 \
+  OMP_NUM_THREADS=1 \
+  LIBRARY_PATH="${PECAN_ENV}/lib" \
+  LD_LIBRARY_PATH="${PECAN_ENV}/lib" \
+    "${PECAN_ENV}/bin/Rscript" -e "
+      options(renv.install.timeout = 21600, renv.config.install.jobs = ${INSTALL_JOBS})
+      lockfile <- renv:::renv_lockfile_read('${PECAN_ENV}/renv.lock')
+      targets <- c('PEcAn.data.remote', 'PEcAn.SIPNET')
+      reqs <- lapply(lockfile\$Packages, function(rec) if (is.null(rec\$Requirements)) character(0) else rec\$Requirements)
+      frontier <- targets
+      closure <- character(0)
+      repeat {
+        hit <- names(reqs)[vapply(reqs, function(r) any(frontier %in% r), logical(1))]
+        new <- setdiff(hit, closure)
+        if (!length(new)) break
+        closure <- union(closure, new)
+        frontier <- new
+      }
+      renv::restore(lockfile = '${PECAN_ENV}/renv.lock', packages = closure, prompt = FALSE)
     "
   validate
   echo ""
@@ -157,6 +249,36 @@ conda-unpack
 
 # 4. Restore R packages
 log "Restoring R packages — this takes 20-40 minutes..."
+# PEcAn.data.remote and PEcAn.SIPNET are genuinely GitHub-subdir packages in the
+# lockfile (modules/data.remote, models/sipnet — pulled off develop, not yet in an
+# r-universe build). renv::restore()'s git-style subdir extraction for records like
+# this stages into a path keyed only by package name, and collides with itself
+# ("target file ... already exists" under renv-graph-staging) regardless of
+# ordering or parallelism.
+#
+# Fix: renv::restore(exclude = ...) skips them, but its docs warn that an exclude
+# request is ignored for any package still needed as a dependency of something else
+# in scope — and PEcAn.all Depends on PEcAn.data.remote directly (confirmed against
+# its DESCRIPTION), so excluding just the two targets (or even them plus the two
+# dependents we first guessed at, PEcAn.workflow/PEcAnAssimSequential) still left
+# PEcAn.all pulling PEcAn.data.remote back in and hitting the same staging bug. Rather
+# than keep enumerating dependents by hand, the exclude set below is computed from
+# each lockfile record's own Requirements field (renv's Depends+Imports+LinkingTo
+# closure, the same one pak's restore graph itself uses) — the full set of packages
+# that transitively require either target, however deep — so nothing is missed.
+# This lets the rest of the lockfile — including arrow — restore normally, fully
+# lockfile-pinned. Only then are the two broken records installed directly via
+# renv::install(),
+# bypassing restore()'s graph/staging path; pinned to the RemoteSha already recorded
+# in the lockfile (not the floating "develop" branch) so this reuses the source
+# tarball already cached at build time instead of re-resolving "develop" against
+# GitHub right now and possibly pulling a different, untested commit. Doing this
+# only after the exclude-restore matters: renv's pak backend installs with
+# upgrade = FALSE, leaving already-installed dependencies alone unless a
+# constraint demands otherwise (github.com/rstudio/renv/issues/2329) — so arrow
+# needs to already be installed at the locked version by this point, or pak will
+# freely resolve it (and got 25.0.1, which doesn't build against the older
+# conda-linked libarrow, when this ran before arrow was restored).
 R_LIBS="${PECAN_ENV}/lib/R/library" \
 R_LIBS_USER="" \
 R_LIBS_SITE="" \
@@ -166,9 +288,25 @@ RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
 ARROW_HOME="${PECAN_ENV}" \
 PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
 PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+OPENBLAS_NUM_THREADS=1 \
+OMP_NUM_THREADS=1 \
+LIBRARY_PATH="${PECAN_ENV}/lib" \
+LD_LIBRARY_PATH="${PECAN_ENV}/lib" \
   "${PECAN_ENV}/bin/Rscript" -e "
-    options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
-    renv::restore(lockfile = '${PECAN_ENV}/renv.lock', packages = c('PEcAnAssimSequential', 'nneo', 'amerifluxr'), prompt = FALSE)
+    options(renv.install.timeout = 21600, renv.config.install.jobs = ${INSTALL_JOBS})
+    lockfile <- renv:::renv_lockfile_read('${PECAN_ENV}/renv.lock')
+    targets <- c('PEcAn.data.remote', 'PEcAn.SIPNET')
+    reqs <- lapply(lockfile\$Packages, function(rec) if (is.null(rec\$Requirements)) character(0) else rec\$Requirements)
+    frontier <- targets
+    closure <- character(0)
+    repeat {
+      hit <- names(reqs)[vapply(reqs, function(r) any(frontier %in% r), logical(1))]
+      new <- setdiff(hit, closure)
+      if (!length(new)) break
+      closure <- union(closure, new)
+      frontier <- new
+    }
+    renv::restore(lockfile = '${PECAN_ENV}/renv.lock', exclude = union(targets, closure), prompt = FALSE)
   "
 R_LIBS="${PECAN_ENV}/lib/R/library" \
 R_LIBS_USER="" \
@@ -179,9 +317,47 @@ RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
 ARROW_HOME="${PECAN_ENV}" \
 PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
 PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+OPENBLAS_NUM_THREADS=1 \
+OMP_NUM_THREADS=1 \
+LIBRARY_PATH="${PECAN_ENV}/lib" \
+LD_LIBRARY_PATH="${PECAN_ENV}/lib" \
   "${PECAN_ENV}/bin/Rscript" -e "
-    options(renv.install.timeout = 21600, renv.config.install.jobs = 2)
-    renv::restore(lockfile = '${PECAN_ENV}/renv.lock', prompt = FALSE)
+    options(renv.install.timeout = 21600, repos = c(CRAN = 'https://cloud.r-project.org', pecan = 'https://pecanproject.r-universe.dev'), timeout = 600)
+    lockfile <- renv:::renv_lockfile_read('${PECAN_ENV}/renv.lock')
+    specs <- vapply(c('PEcAn.data.remote', 'PEcAn.SIPNET'), function(pkg) {
+      rec <- lockfile\$Packages[[pkg]]
+      paste0('github::', rec\$RemoteUsername, '/', rec\$RemoteRepo, '/', rec\$RemoteSubdir, '@', rec\$RemoteSha)
+    }, character(1))
+    renv::install(specs)
+  "
+R_LIBS="${PECAN_ENV}/lib/R/library" \
+R_LIBS_USER="" \
+R_LIBS_SITE="" \
+RENV_PATHS_CACHE="${PECAN_ENV}/renv-source-cache" \
+RENV_PATHS_SOURCE="${PECAN_ENV}/renv-source-cache/sources" \
+RENV_PATHS_LIBRARY="${PECAN_ENV}/lib/R/library" \
+ARROW_HOME="${PECAN_ENV}" \
+PKG_CONFIG_PATH="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+PKG_CONFIG_LIBDIR="${PECAN_ENV}/lib/pkgconfig:${PECAN_ENV}/share/pkgconfig" \
+OPENBLAS_NUM_THREADS=1 \
+OMP_NUM_THREADS=1 \
+LIBRARY_PATH="${PECAN_ENV}/lib" \
+LD_LIBRARY_PATH="${PECAN_ENV}/lib" \
+  "${PECAN_ENV}/bin/Rscript" -e "
+    options(renv.install.timeout = 21600, renv.config.install.jobs = ${INSTALL_JOBS})
+    lockfile <- renv:::renv_lockfile_read('${PECAN_ENV}/renv.lock')
+    targets <- c('PEcAn.data.remote', 'PEcAn.SIPNET')
+    reqs <- lapply(lockfile\$Packages, function(rec) if (is.null(rec\$Requirements)) character(0) else rec\$Requirements)
+    frontier <- targets
+    closure <- character(0)
+    repeat {
+      hit <- names(reqs)[vapply(reqs, function(r) any(frontier %in% r), logical(1))]
+      new <- setdiff(hit, closure)
+      if (!length(new)) break
+      closure <- union(closure, new)
+      frontier <- new
+    }
+    renv::restore(lockfile = '${PECAN_ENV}/renv.lock', packages = closure, prompt = FALSE)
   "
 
 # 5. Verify
