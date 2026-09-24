@@ -124,12 +124,28 @@ if [[ -e "${PECAN_ENV}" ]]; then
   # dependency graph to get wrong), then install each one individually, one call at a
   # time, in the same order the build itself used. A single-target install() only ever
   # has to resolve for that one package, so there is no second reference to collide
-  # with. GitHub-sourced records are pinned to the RemoteSha already recorded in the
-  # lockfile (not a floating branch) so they reuse the source tarball already cached at
-  # build time under RENV_PATHS_SOURCE instead of hitting the network. This also avoids
-  # arrow drifting to a newer version pak would otherwise resolve freely for an
-  # unconstrained dependency: everything non-PEcAn (including arrow) is restored,
-  # lockfile-pinned, by the bulk call below before any of these packages get installed.
+  # with. Every OURS package is installed from the exact source tarball already cached
+  # at build time under RENV_PATHS_SOURCE — RENV_PATHS_SOURCE/github/<pkg>/<pkg>_<sha>.tar.gz
+  # for GitHub-sourced records (pinned to RemoteSha), RENV_PATHS_SOURCE/repository/<pkg>/<pkg>_<version>.tar.gz
+  # for Repository-sourced ones (pinned to Version) — never a bare package name or a
+  # github::org/repo@sha spec. Both of those ask a live service (r-universe or the
+  # GitHub API) to resolve the reference before ever touching the local cache, and both
+  # have bitten this build: a bare-name renv::install() re-resolves "whatever
+  # r-universe currently publishes" — usually a no-op cache hit, but r-universe rebuilds
+  # continuously without requiring a Version bump, so a package's current DESCRIPTION
+  # can silently gain a new dependency that was never part of the original build
+  # (confirmed: PEcAn.assim.batch's current r-universe build pulls in quadform, which
+  # the Sept 2026 build never installed); a github::...@sha spec still calls the GitHub
+  # commits API to resolve that sha before installing, which fails outright if that
+  # call is rate-limited or errors, even though the exact commit is already cached
+  # locally (confirmed against api.github.com/repos/PecanProject/pecan/commits/<sha>
+  # during a real restore run). Installing straight from the cached tarball path skips
+  # both live-resolution steps entirely: the exact DESCRIPTION and source from build
+  # time is used, unconditionally, and the install fails loudly (stop()) rather than
+  # silently drifting if that cached artifact is ever missing. This also avoids arrow
+  # drifting to a newer version pak would otherwise resolve freely for an unconstrained
+  # dependency: everything non-PEcAn (including arrow) is restored, lockfile-pinned, by
+  # the bulk call below before any of these packages get installed.
   OURS="PEcAn.logger,PEcAn.utils,PEcAn.settings,PEcAn.DB,PEcAn.remote,PEcAn.priors,PEcAn.MA,PEcAn.emulator,PEcAn.uncertainty,PEcAn.data.remote,PEcAn.data.atmosphere,PEcAn.data.land,PEcAn.benchmark,PEcAn.workflow,PEcAn.assim.batch,PEcAn.all,PEcAn.RothC,PEPRMT,PEcAn.SIPNET,nneo,amerifluxr,PEcAnAssimSequential"
   R_LIBS="${PECAN_ENV}/lib/R/library" \
   R_LIBS_USER="" \
@@ -172,12 +188,13 @@ if [[ -e "${PECAN_ENV}" ]]; then
         rec <- lockfile\$Packages[[pkg]]
         if (is.null(rec)) next
         spec <- if (identical(rec\$Source, 'GitHub')) {
-          base <- paste0(rec\$RemoteUsername, '/', rec\$RemoteRepo)
-          subdir <- rec\$RemoteSubdir
-          if (!is.null(subdir) && nzchar(subdir)) base <- paste0(base, '/', subdir)
-          paste0('github::', base, '@', rec\$RemoteSha)
+          tarball <- file.path(Sys.getenv('RENV_PATHS_SOURCE'), 'github', pkg, paste0(pkg, '_', rec\$RemoteSha, '.tar.gz'))
+          if (!file.exists(tarball)) stop('missing cached source for ', pkg, ' at ', tarball)
+          tarball
         } else {
-          pkg
+          tarball <- file.path(Sys.getenv('RENV_PATHS_SOURCE'), 'repository', pkg, paste0(pkg, '_', rec\$Version, '.tar.gz'))
+          if (!file.exists(tarball)) stop('missing cached source for ', pkg, ' at ', tarball)
+          tarball
         }
         renv::install(spec)
       }
@@ -195,9 +212,11 @@ if [[ -e "${PECAN_ENV}" ]]; then
   OMP_NUM_THREADS=1 \
   LIBRARY_PATH="${PECAN_ENV}/lib" \
   LD_LIBRARY_PATH="${PECAN_ENV}/lib" \
+  OURS="${OURS}" \
     "${PECAN_ENV}/bin/Rscript" -e "
       options(renv.install.timeout = 21600, renv.config.install.jobs = ${INSTALL_JOBS})
-      renv::restore(lockfile = '${PECAN_ENV}/renv.lock', prompt = FALSE)
+      ours <- strsplit(Sys.getenv('OURS'), ',')[[1]]
+      renv::restore(lockfile = '${PECAN_ENV}/renv.lock', exclude = ours, prompt = FALSE)
     "
   validate
   echo ""
@@ -246,12 +265,29 @@ log "Restoring R packages — this takes 20-40 minutes..."
 # dependency graph to get wrong), then install each one individually, one call at a
 # time, in the same order the build itself used. A single-target install() only ever
 # has to resolve for that one package, so there is no second reference to collide
-# with. GitHub-sourced records are pinned to the RemoteSha already recorded in the
-# lockfile (not a floating branch) so they reuse the source tarball already cached at
-# build time under RENV_PATHS_SOURCE instead of hitting the network. This also avoids
-# arrow drifting to a newer version pak would otherwise resolve freely for an
-# unconstrained dependency: everything non-PEcAn (including arrow) is restored,
-# lockfile-pinned, by the bulk call below before any of these packages get installed.
+# with. Every OURS package is installed from the exact source tarball already cached
+# at build time under RENV_PATHS_SOURCE — RENV_PATHS_SOURCE/github/<pkg>/<pkg>_<sha>.tar.gz
+# for GitHub-sourced records (pinned to RemoteSha), RENV_PATHS_SOURCE/repository/<pkg>/<pkg>_<version>.tar.gz
+# for Repository-sourced ones (pinned to Version) — never a bare package name or a
+# github::org/repo@sha spec. Both of those ask a live service (r-universe or the
+# GitHub API) to resolve the reference before ever touching the local cache, and both
+# have bitten this build: a bare-name renv::install() re-resolves "whatever
+# r-universe currently publishes" — usually a no-op cache hit, but r-universe rebuilds
+# continuously without requiring a Version bump, so a package's current DESCRIPTION
+# can silently gain a new dependency that was never part of the original build
+# (confirmed: PEcAn.assim.batch's current r-universe build pulls in quadform, which
+# the Sept 2026 build never installed); a github::...@sha spec still calls the GitHub
+# commits API to resolve that sha before installing, which fails outright if that
+# call is rate-limited or errors, even though the exact commit is already cached
+# locally (confirmed against api.github.com/repos/PecanProject/pecan/commits/<sha>
+# during a real restore run). Installing straight from the cached tarball path skips
+# both live-resolution steps entirely: the exact DESCRIPTION and source from build
+# time is used, unconditionally, and the install fails loudly (stop()) rather than
+# silently drifting if that cached artifact is ever missing. This also avoids arrow
+# drifting to a newer version pak would otherwise resolve freely for an unconstrained
+# dependency: everything non-PEcAn (including arrow) is restored, lockfile-pinned, by
+# the bulk call below before any
+# of these packages get installed.
 OURS="PEcAn.logger,PEcAn.utils,PEcAn.settings,PEcAn.DB,PEcAn.remote,PEcAn.priors,PEcAn.MA,PEcAn.emulator,PEcAn.uncertainty,PEcAn.data.remote,PEcAn.data.atmosphere,PEcAn.data.land,PEcAn.benchmark,PEcAn.workflow,PEcAn.assim.batch,PEcAn.all,PEcAn.RothC,PEPRMT,PEcAn.SIPNET,nneo,amerifluxr,PEcAnAssimSequential"
 R_LIBS="${PECAN_ENV}/lib/R/library" \
 R_LIBS_USER="" \
@@ -294,12 +330,13 @@ OURS="${OURS}" \
       rec <- lockfile\$Packages[[pkg]]
       if (is.null(rec)) next
       spec <- if (identical(rec\$Source, 'GitHub')) {
-        base <- paste0(rec\$RemoteUsername, '/', rec\$RemoteRepo)
-        subdir <- rec\$RemoteSubdir
-        if (!is.null(subdir) && nzchar(subdir)) base <- paste0(base, '/', subdir)
-        paste0('github::', base, '@', rec\$RemoteSha)
+        tarball <- file.path(Sys.getenv('RENV_PATHS_SOURCE'), 'github', pkg, paste0(pkg, '_', rec\$RemoteSha, '.tar.gz'))
+        if (!file.exists(tarball)) stop('missing cached source for ', pkg, ' at ', tarball)
+        tarball
       } else {
-        pkg
+        tarball <- file.path(Sys.getenv('RENV_PATHS_SOURCE'), 'repository', pkg, paste0(pkg, '_', rec\$Version, '.tar.gz'))
+        if (!file.exists(tarball)) stop('missing cached source for ', pkg, ' at ', tarball)
+        tarball
       }
       renv::install(spec)
     }
@@ -317,9 +354,11 @@ OPENBLAS_NUM_THREADS=1 \
 OMP_NUM_THREADS=1 \
 LIBRARY_PATH="${PECAN_ENV}/lib" \
 LD_LIBRARY_PATH="${PECAN_ENV}/lib" \
+OURS="${OURS}" \
   "${PECAN_ENV}/bin/Rscript" -e "
     options(renv.install.timeout = 21600, renv.config.install.jobs = ${INSTALL_JOBS})
-    renv::restore(lockfile = '${PECAN_ENV}/renv.lock', prompt = FALSE)
+    ours <- strsplit(Sys.getenv('OURS'), ',')[[1]]
+    renv::restore(lockfile = '${PECAN_ENV}/renv.lock', exclude = ours, prompt = FALSE)
   "
 
 # 5. Verify
