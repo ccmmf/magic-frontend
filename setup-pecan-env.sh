@@ -190,7 +190,15 @@ if [[ -e "${PECAN_ENV}" ]]; then
         spec <- if (identical(rec\$Source, 'GitHub')) {
           tarball <- file.path(Sys.getenv('RENV_PATHS_SOURCE'), 'github', pkg, paste0(pkg, '_', rec\$RemoteSha, '.tar.gz'))
           if (!file.exists(tarball)) stop('missing cached source for ', pkg, ' at ', tarball)
-          tarball
+          extract_dir <- tempfile(paste0('renv-gh-', pkg, '-'))
+          dir.create(extract_dir)
+          utils::untar(tarball, exdir = extract_dir)
+          top <- list.dirs(extract_dir, recursive = FALSE)
+          if (length(top) != 1) stop('unexpected archive layout for ', pkg, ' at ', tarball)
+          gh_subdir <- rec\$RemoteSubdir
+          pkg_dir <- if (!is.null(gh_subdir) && nzchar(gh_subdir)) file.path(top, gh_subdir) else top
+          if (!file.exists(file.path(pkg_dir, 'DESCRIPTION'))) stop('no DESCRIPTION for ', pkg, ' at ', pkg_dir)
+          pkg_dir
         } else {
           tarball <- file.path(Sys.getenv('RENV_PATHS_SOURCE'), 'repository', pkg, paste0(pkg, '_', rec\$Version, '.tar.gz'))
           if (!file.exists(tarball)) stop('missing cached source for ', pkg, ' at ', tarball)
@@ -332,7 +340,15 @@ OURS="${OURS}" \
       spec <- if (identical(rec\$Source, 'GitHub')) {
         tarball <- file.path(Sys.getenv('RENV_PATHS_SOURCE'), 'github', pkg, paste0(pkg, '_', rec\$RemoteSha, '.tar.gz'))
         if (!file.exists(tarball)) stop('missing cached source for ', pkg, ' at ', tarball)
-        tarball
+        extract_dir <- tempfile(paste0('renv-gh-', pkg, '-'))
+        dir.create(extract_dir)
+        utils::untar(tarball, exdir = extract_dir)
+        top <- list.dirs(extract_dir, recursive = FALSE)
+        if (length(top) != 1) stop('unexpected archive layout for ', pkg, ' at ', tarball)
+        gh_subdir <- rec\$RemoteSubdir
+        pkg_dir <- if (!is.null(gh_subdir) && nzchar(gh_subdir)) file.path(top, gh_subdir) else top
+        if (!file.exists(file.path(pkg_dir, 'DESCRIPTION'))) stop('no DESCRIPTION for ', pkg, ' at ', pkg_dir)
+        pkg_dir
       } else {
         tarball <- file.path(Sys.getenv('RENV_PATHS_SOURCE'), 'repository', pkg, paste0(pkg, '_', rec\$Version, '.tar.gz'))
         if (!file.exists(tarball)) stop('missing cached source for ', pkg, ' at ', tarball)
