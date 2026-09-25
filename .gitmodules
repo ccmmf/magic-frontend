@@ -1,0 +1,11 @@
+[submodule "workflows"]
+	path = workflows
+	url = https://github.com/ccmmf/workflows
+	branch = projections
+[submodule "downscaling"]
+	path = downscaling
+	url = https://github.com/ccmmf/downscaling.git
+	branch = develop
+[submodule "magic-training"]
+	path = magic-training
+	url = https://github.com/ccmmf/magic-training
