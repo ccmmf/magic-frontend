@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# magic-pecan: top-level CLI for the CCMMF MAGIC project.
+# Usage: ./magic-pecan <command> [args]
+# Commands: help | init | update | install
+
+set -euo pipefail
+
+# --- Repo root from this script's real location (works from any CWD, via symlinks) ---
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(dirname "$SCRIPT_PATH")"
+GITMODULES="${REPO_ROOT}/.gitmodules"
+TOOLS_DIR="${REPO_ROOT}/tools"
+PROFILE_OVERRIDE=""
+DEFAULT_ENV="${HOME}/.conda/envs/pecan-all"
+
+usage() {
+  cat <<'EOF'
+Usage: magic-pecan [--profile <name>] <command> [args]
+
+Global options (before the command):
+  --profile <name>     AWS profile for all steps (default: $AWS_PROFILE, else 'magic').
+
+Commands:
+  help                 Print this usage.
+
+  init [name ...]      Initialize submodules at their pinned commits.
+                       With no names, initializes every submodule in .gitmodules.
+
+  update [name ...]    Advance submodules to the tip of the branch set in
+                       .gitmodules (git submodule update --remote). Moves the
+                       pins; review and commit the result.
+
+  install              List available PEcAn environments (newest first) and show
+                       the command to install the newest. No download.
+  install <VERSION|latest> [ENV_PATH] [--yes]
+                       Install an environment. If ENV_PATH is omitted, the default
+                       path is confirmed interactively; --yes accepts it without
+                       a prompt (required when no terminal is attached).
+                       Errors if ENV_PATH already exists.
+
+Submodule names are the paths listed in .gitmodules.
+init and install require the aws CLI (module load awscli_v2) and a configured profile
+(default 'magic'; override with AWS_PROFILE).
+EOF
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+# --- Preflight: git present, repo is a work tree, .gitmodules exists ---
+preflight() {
+  command -v git >/dev/null 2>&1 || die "git not found on PATH."
+  git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "${REPO_ROOT} is not a git work tree (tarball/ZIP download?). Clone with git instead."
+  [[ -f "$GITMODULES" ]] || die "No .gitmodules found at ${GITMODULES}."
+}
+
+# --- Submodule paths declared in .gitmodules ---
+list_submodules() {
+  git config -f "$GITMODULES" --get-regexp '^submodule\..*\.path$' | awk '{print $2}'
+}
+
+# --- Resolve requested names (or all) into SELECTED[]; validate against .gitmodules ---
+select_submodules() {
+  local -a valid
+  mapfile -t valid < <(list_submodules)
+  [[ ${#valid[@]} -gt 0 ]] || die "No submodules declared in .gitmodules."
+  SELECTED=()
+  if [[ $# -eq 0 ]]; then
+    SELECTED=("${valid[@]}")
+    return
+  fi
+  local name v found
+  for name in "$@"; do
+    found=0
+    for v in "${valid[@]}"; do [[ "$name" == "$v" ]] && found=1 && break; done
+    [[ $found -eq 1 ]] || die "Unknown submodule '${name}'. Valid: ${valid[*]}"
+    SELECTED+=("$name")
+  done
+}
+
+# --- Per-submodule status; warns on dirty/uninitialized/conflicted. Returns nonzero if any not checked out ---
+report_status() {
+  local rc=0 path line flag sha desc
+  echo "Submodule status:"
+  for path in "$@"; do
+    line="$(git -C "$REPO_ROOT" submodule status -- "$path")"
+    flag="${line:0:1}"
+    sha="$(awk '{print $1}' <<<"${line:1}")"
+    case "$flag" in
+      "-") echo "  ${path}: NOT INITIALIZED"; rc=1; continue ;;
+      "U") echo "  ${path}: MERGE CONFLICT"; rc=1; continue ;;
+    esac
+    desc="$(git -C "${REPO_ROOT}/${path}" describe --tags --always 2>/dev/null || echo "-")"
+    if [[ "$flag" == "+" ]]; then
+      echo "  ${path}: ${sha:0:7} (${desc}) WARNING: checked-out commit differs from recorded pin"
+    elif [[ -n "$(git -C "${REPO_ROOT}/${path}" status --porcelain 2>/dev/null)" ]]; then
+      echo "  ${path}: ${sha:0:7} (${desc}) WARNING: local modifications present"
+    else
+      echo "  ${path}: ${sha:0:7} (${desc})"
+    fi
+  done
+  return $rc
+}
+
+cmd_init() {
+  preflight
+  select_submodules "$@"
+  echo "Initializing: ${SELECTED[*]}"
+  git -C "$REPO_ROOT" submodule update --init --recursive -- "${SELECTED[@]}" \
+    || die "git submodule update failed."
+  local sub_rc=0
+  report_status "${SELECTED[@]}" || sub_rc=1
+
+  # AWS readiness check (after submodule work, so that work is never skipped).
+  echo "Checking AWS environment bucket access..."
+  local aws_err
+  if aws_err="$("${TOOLS_DIR}/list-environments.sh" 2>&1 >/dev/null)"; then
+    echo "AWS check: OK"
+  else
+    echo "AWS check: FAILED" >&2
+    echo "${aws_err}" >&2
+    echo "Submodules were initialized. The AWS check is needed for 'install' and other steps." >&2
+    exit 1
+  fi
+  [[ $sub_rc -eq 0 ]] || die "One or more submodules failed to check out."
+}
+
+cmd_update() {
+  preflight
+  select_submodules "$@"
+  echo "Updating to tracked branch tips: ${SELECTED[*]}"
+  git -C "$REPO_ROOT" submodule update --init --recursive --remote -- "${SELECTED[@]}" \
+    || die "git submodule update --remote failed."
+  report_status "${SELECTED[@]}" || die "One or more submodules failed to check out."
+}
+
+cmd_install() {
+  preflight
+  local version="" env_path="" assume_yes=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      -y|--yes) assume_yes=1 ;;
+      -*)       die "Unknown option '${arg}'." ;;
+      *)
+        if   [[ -z "$version"  ]]; then version="$arg"
+        elif [[ -z "$env_path" ]]; then env_path="$arg"
+        else die "Too many arguments."
+        fi ;;
+    esac
+  done
+
+  # AWS check runs before anything else.
+  local errfile out rc=0
+  errfile="$(mktemp)"
+  out="$("${TOOLS_DIR}/list-environments.sh" 2>"$errfile")" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    cat "$errfile" >&2
+    rm -f "$errfile"
+    exit 1
+  fi
+  rm -f "$errfile"
+
+  local -a lines
+  mapfile -t lines <<<"$out"
+  local tab=$'\t'
+  local newest="${lines[0]%%${tab}*}"
+
+  # No version: list and help.
+  if [[ -z "$version" ]]; then
+    echo "Available environments (newest first):"
+    printf '  %-10s %s\n' "VERSION" "LAST-MODIFIED"
+    local l
+    for l in "${lines[@]}"; do
+      printf '  %-10s %s\n' "${l%%${tab}*}" "${l#*${tab}}"
+    done
+    echo ""
+    echo "To install the most recent version (${newest}):"
+    local pf=""
+    [[ -n "$PROFILE_OVERRIDE" ]] && pf="--profile ${PROFILE_OVERRIDE} "
+    echo "  magic-pecan ${pf}install latest"
+    echo "  magic-pecan ${pf}install ${newest} [ENV_PATH]"
+    echo "Default ENV_PATH: ${DEFAULT_ENV}"
+    return 0
+  fi
+
+  # Resolve and validate version.
+  [[ "$version" == "latest" ]] && version="$newest"
+  local m found=0
+  for m in "${lines[@]}"; do
+    [[ "${m%%${tab}*}" == "$version" ]] && found=1 && break
+  done
+  [[ $found -eq 1 ]] || die "Version '${version}' not found. Run 'magic-pecan install' to list available versions."
+
+  # Target path: existing path is an error; default path requires confirmation.
+  local defaulted=0
+  if [[ -z "$env_path" ]]; then env_path="$DEFAULT_ENV"; defaulted=1; fi
+  if [[ -e "$env_path" ]]; then
+    die "Environment path already exists: ${env_path}. Remove that environment directory and re-run."
+  fi
+  if [[ $defaulted -eq 1 && $assume_yes -eq 0 ]]; then
+    if [[ -t 0 ]]; then
+      local reply
+      read -r -p "Install pecan-all-${version} to ${env_path}? [y/N] " reply
+      [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]] || die "Not confirmed. Aborted."
+    else
+      die "ENV_PATH not provided and no terminal to confirm default (${env_path}). Pass ENV_PATH or --yes."
+    fi
+  fi
+
+  echo "Installing pecan-all-${version} to ${env_path}"
+  # Run as a child (not exec) so the closing blank line is printed afterward.
+  local setup_rc=0
+  "${TOOLS_DIR}/setup-pecan-env.sh" "$version" "$env_path" || setup_rc=$?
+  exit "$setup_rc"
+}
+
+main() {
+  # Blank-line buffers around all output (including errors and early exits).
+  echo
+  trap 'echo' EXIT
+
+  # Global options (before the command). --profile is exported as AWS_PROFILE,
+  # which tools/ scripts (including setup-pecan-env.sh) and the aws CLI honor.
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile)
+        [[ -n "${2:-}" && "${2:0:1}" != "-" ]] || die "--profile requires a profile name."
+        PROFILE_OVERRIDE="$2"; shift 2 ;;
+      --profile=*)
+        PROFILE_OVERRIDE="${1#--profile=}"
+        [[ -n "$PROFILE_OVERRIDE" ]] || die "--profile requires a profile name."
+        shift ;;
+      *) break ;;
+    esac
+  done
+  if [[ -n "$PROFILE_OVERRIDE" ]]; then
+    export AWS_PROFILE="$PROFILE_OVERRIDE"
+  fi
+
+  local cmd="${1:-help}"
+  [[ $# -gt 0 ]] && shift
+  case "$cmd" in
+    help|-h|--help) usage ;;
+    init)           cmd_init "$@" ;;
+    update)         cmd_update "$@" ;;
+    install)        cmd_install "$@" ;;
+    *)              usage >&2; die "Unknown command '${cmd}'." ;;
+  esac
+}
+
+main "$@"

@@ -73,25 +73,20 @@ trap cleanup EXIT
 
 # ---- PREFLIGHT ----
 if ! aws_version_ok; then
-  log "aws CLI not found or version too old. Attempting to load the aws module..."
-  module load aws 2>/dev/null || true
-  aws_version_ok || die "aws CLI >= 1.29 (or v2) is required. Install a compatible version or load the aws module before running this script."
+  log "aws CLI not found or version too old. Attempting to load the awscli_v2 module..."
+  module load awscli_v2 2>/dev/null || true
+  if ! command -v aws >/dev/null 2>&1; then
+    die "aws CLI not found on PATH. Fix: module load awscli_v2"
+  fi
+  aws_version_ok || die "aws CLI version is too old (need >= 1.29). Fix: module load awscli_v2"
 fi
 
-if ! grep -qs "\[${S3_PROFILE}\]" "${HOME}/.aws/credentials" 2>/dev/null; then
+if ! aws configure list-profiles 2>/dev/null | grep -Fxq -- "${S3_PROFILE}"; then
   die "
-       AWS profile '${S3_PROFILE}' not found in ~/.aws/credentials.
+       AWS profile '${S3_PROFILE}' is not configured (not listed by 'aws configure list-profiles').
 
-       Add a [${S3_PROFILE}] section with aws_access_key_id and aws_secret_access_key.
-
-       Optionally, to use a different profile, set AWS_PROFILE before running:
-         AWS_PROFILE=myprofile $0 ${PECAN_VERSION:-<VERSION>}"
-fi
-if ! grep -qs "\[profile ${S3_PROFILE}\]" "${HOME}/.aws/config" 2>/dev/null; then
-  die "
-       AWS profile '${S3_PROFILE}' not found in ~/.aws/config.
-
-       Add a [profile ${S3_PROFILE}] section with region and endpoint_url.
+       Configure it with credentials (access key id and secret) and a region and
+       endpoint_url, for example: aws configure --profile ${S3_PROFILE}
 
        Optionally, to use a different profile, set AWS_PROFILE before running:
          AWS_PROFILE=myprofile $0 ${PECAN_VERSION:-<VERSION>}"
